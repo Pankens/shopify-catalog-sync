@@ -1,31 +1,39 @@
- jobs:
-   sync:
-     runs-on: ubuntu-latest
+name: Sync Shopify Products
 
-+    # Con esto le decimos a requests que use el CA store del sistema
-+    env:
-+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+# Se ejecuta cada 2 horas y permite dispararlo manualmente
+on:
+  schedule:
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
 
-     steps:
-       - name: Checkout repository
-         uses: actions/checkout@v4
+jobs:
+  sync:
+    runs-on: ubuntu-latest
 
-       - name: Setup Python
-         uses: actions/setup-python@v4
-         with:
-           python-version: '3.x'
+    steps:
+      # 1) Chequea tu código
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-       - name: Install dependencies
-         run: |
-           python -m pip install --upgrade pip
-           pip install -r requirements.txt
+      # 2) Prepara Python 3.x
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
 
-       - name: Run sync_products.py
-         env:
-           SHOP_URL:      ${{ secrets.SHOP_URL }}
-           SHOP_TOKEN:    ${{ secrets.SHOP_TOKEN }}
-           LOCATION_ID:   ${{ secrets.LOCATION_ID }}
-           SUBFAMILIAS:   ${{ secrets.SUBFAMILIAS }}
-           PUBLICATION_ID:  ${{ secrets.PUBLICATION_ID }}
-+          REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
-         run: python sync_products.py
+      # 3) Instala dependencias
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 4) Ejecuta el script con las variables de entorno
+      - name: Run sync_products.py
+        env:
+          SHOP_URL:        ${{ secrets.SHOP_URL }}
+          SHOP_TOKEN:      ${{ secrets.SHOP_TOKEN }}
+          LOCATION_ID:     ${{ secrets.LOCATION_ID }}
+          SUBFAMILIAS:     ${{ secrets.SUBFAMILIAS }}
+          PUBLICATION_ID:  ${{ secrets.PUBLICATION_ID }}
+          REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+        run: python sync_products.py
