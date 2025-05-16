@@ -40,5 +40,6 @@ jobs:
           LOCATION_ID:     ${{ secrets.LOCATION_ID }}
           SUBFAMILIAS:     ${{ secrets.SUBFAMILIAS }}
           PUBLICATION_ID:  ${{ secrets.PUBLICATION_ID }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
         run: python sync_products.py
