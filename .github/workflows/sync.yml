@@ -1,9 +1,9 @@
 name: Sync Shopify Products
 
-# Se ejecuta cada 2 horas y permite dispararlo manualmente
+# Se ejecuta cada 4 horas y permite dispararlo manualmente
 on:
   schedule:
-    - cron: '0 */2 * * *'
+    - cron: '0 */4 * * *'
   workflow_dispatch:
 
 jobs:
