@@ -1,263 +1,220 @@
-#!/usr/bin/env python3
 import os
-import json
-import io
-import time
-import argparse
-import math
-from urllib.parse import quote_plus
-
 import requests
-from dotenv import load_dotenv
+import json
 
-# ——— Carga de configuración ———
-load_dotenv()
-SHOP_URL       = os.getenv("SHOP_URL")
-SHOP_TOKEN     = os.getenv("SHOP_TOKEN")
-LOCATION_ID    = os.getenv("LOCATION_ID")
-RAW_SUBS       = os.getenv("SUBFAMILIAS", "")
-PUBLICATION_ID = os.getenv("PUBLICATION_ID")
+# Configuración de la API de Shopify
+SHOP_NAME = os.getenv("SHOP_NAME")  # e.g. "mi-tienda"
+API_VERSION = "2023-10"
+ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")  # token de acceso privado a la API de Admin
+GRAPHQL_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/{API_VERSION}/graphql.json"
 
-# ——— Parámetros de cálculo de precio ———
-IVA = 21.0  # IVA en porcentaje
-
-# ——— Cabeceras y endpoint ———
-HEADERS           = {
-    "Content-Type": "application/json",
-    "X-Shopify-Access-Token": SHOP_TOKEN
-}
-GRAPHQL_ENDPOINT  = f"https://{SHOP_URL}/admin/api/2024-10/graphql.json"
-SUBFAMILIAS       = [s.strip() for s in RAW_SUBS.split(",") if s.strip()]
-
-
-def fetch_external():
-    productos = []
-    for sub in SUBFAMILIAS:
-        url = f"https://fastapi-megasur.onrender.com/catalogo?subfamilia={quote_plus(sub)}"
-        resp = requests.get(url); resp.raise_for_status()
-        productos.extend(resp.json())
-    return productos
-
-
-def build_jsonl_lines(productos):
-    lines = []
-    for p in productos:
-        ean    = str(p.get("EAN", "")) 
-        sku    = str(p.get("REF", "")) 
-        title  = p.get("NAME", "")    
-        subfam = p.get("SUBFAMILIA", "")
-
-        # Cálculo de precio truncado a 2 decimales
-        pvd_raw       = p.get("PVD", "0").replace(".", "").replace(",", ".")
-        canon_raw     = p.get("CANON", "0").replace(".", "").replace(",", ".")
-        margin_pct    = float(p.get("MARGIN", "0").replace(".", "").replace(",", "."))
-        pvd           = float(pvd_raw)
-        canon         = float(canon_raw)
-        base          = pvd + canon
-        sin_iva       = base * (1 + margin_pct / 100)
-        con_iva       = sin_iva * (1 + IVA / 100)
-        precio_trunc  = math.floor(con_iva * 100) / 100.0
-        price         = f"{precio_trunc:.2f}"
-
-        stock = int(float(p.get("STOCK", "0")))
-        desc  = p.get("DESCRIPTION", "")
-        img   = p.get("URL_IMG")
-        handle = f"ean-{ean}"
-
-        node = {
-            "handle":          handle,
-            "title":           title,
-            "descriptionHtml": desc,
-            "status":          "ACTIVE",
-            "productType":     subfam,
-            "tags":            ["ImportadoAPI"],
-            "productOptions": [
-                {"name": "SKU", "values": [{"name": sku}]}
-            ],
-            "variants": [
-                {
-                    "sku":               sku,
-                    "barcode":           ean,
-                    "price":             price,
-                    "inventoryPolicy":   "DENY",
-                    "inventoryItem":     {"tracked": True},
-                    "inventoryQuantities": [
-                        {"locationId": LOCATION_ID, "name": "available", "quantity": stock}
-                    ],
-                    "optionValues": [
-                        {"name": sku, "optionName": "SKU"}
-                    ]
-                }
-            ]
-        }
-        if img:
-            node["files"] = [{"alt": title, "originalSource": img}]
-
-        lines.append({"input": node})
-    return lines
-
-
-def staged_upload():
-    mutation = """
-    mutation($input: [StagedUploadInput!]!) {
-      stagedUploadsCreate(input: $input) {
-        stagedTargets { url parameters { name value } }
-        userErrors { field message }
-      }
-    }"""
-    variables = {"input": [{
-        "resource":   "BULK_MUTATION_VARIABLES",
-        "filename":   "productos.jsonl",
-        "mimeType":   "text/jsonl",
-        "httpMethod": "POST"
-    }]}
-    resp = requests.post(GRAPHQL_ENDPOINT, headers=HEADERS,
-                         json={"query": mutation, "variables": variables})
-    resp.raise_for_status()
-    result = resp.json()["data"]["stagedUploadsCreate"]
-    if result.get("userErrors"):
-        print("❌ stagedUploadsCreate errors:")
-        for err in result["userErrors"]:
-            print("   •", err["field"], err["message"])
-        raise SystemExit(1)
-    tgt = result["stagedTargets"][0]
-    params = {p["name"]: p["value"] for p in tgt["parameters"]}
-    return tgt["url"], params, params["key"]
-
-
-def upload_file(upload_url, upload_params, lines):
-    content = "\n".join(json.dumps(l) for l in lines)
-    files   = {"file": ("productos.jsonl", io.BytesIO(content.encode()), "application/json")}
-    resp = requests.post(upload_url, data=upload_params, files=files)
-    resp.raise_for_status()
-
-
-def run_bulk(staged_path):
-    mutation = """
-    mutation($stagedPath: String!, $productMutation: String!) {
-      bulkOperationRunMutation(
-        mutation: $productMutation,
-        stagedUploadPath: $stagedPath
-      ) {
-        bulkOperation { id status }
-        userErrors { field message }
-      }
-    }"""
-    product_mutation = """
-    mutation productUpsert($input: ProductSetInput!) {
-      productSet(input: $input) { product { id } userErrors { field message } }
-    }"""
-    resp = requests.post(GRAPHQL_ENDPOINT, headers=HEADERS, json={
-        "query":     mutation,
-        "variables": {"stagedPath": staged_path, "productMutation": product_mutation}
-    })
-    resp.raise_for_status()
-    data = resp.json()["data"]["bulkOperationRunMutation"]
-    if data.get("userErrors"):
-        print("❌ bulkOperationRunMutation errors:")
-        for err in data["userErrors"]:
-            print("   •", err["field"], err["message"])
-        raise SystemExit(1)
-    bulk_id = data["bulkOperation"]["id"]
-    print("✅ Bulk iniciado:", bulk_id)
-    return bulk_id
-
-
-def wait_for_bulk(bulk_id, interval=5):
-    query = """
-    query($id: ID!) {
-      node(id: $id) {
-        ... on BulkOperation { status }
-      }
-    }"""
-    while True:
-        resp = requests.post(GRAPHQL_ENDPOINT, headers=HEADERS,
-                             json={"query": query, "variables": {"id": bulk_id}})
-        resp.raise_for_status()
-        status = resp.json()["data"]["node"]["status"]
-        print("⏳ BulkOperation status:", status)
-        if status in ("COMPLETED", "FAILED", "CANCELED"):
-            break
-        time.sleep(interval)
-    if status != "COMPLETED":
-        raise RuntimeError(f"Bulk ended with status {status}")
-
-
-def get_imported_ids():
-    query = """
+# Fase 1: Eliminar productos importados previamente con la etiqueta "ImportadoAPI"
+def eliminar_productos_importados():
+    """
+    Elimina de Shopify todos los productos que tengan la etiqueta 'ImportadoAPI'.
+    """
+    query = '''
     query($cursor: String) {
-      products(first: 100, after: $cursor, query: "tag:ImportadoAPI") {
-        pageInfo { hasNextPage }
-        edges { cursor node { id } }
+      products(first: 250, query: "tag:ImportadoAPI", after: $cursor) {
+        edges {
+          node { id }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
       }
-    }"""
-    ids, cursor = [], None
+    }
+    '''
+    headers = {"Content-Type": "application/json", "X-Shopify-Access-Token": ACCESS_TOKEN}
+    productos_a_eliminar = []
+
+    # Paginación para obtener todos los IDs de productos con la etiqueta ImportadoAPI
+    cursor = None
     while True:
-        resp = requests.post(GRAPHQL_ENDPOINT, headers=HEADERS,
-                             json={"query": query, "variables": {"cursor": cursor}})
-        resp.raise_for_status()
-        prod = resp.json()["data"]["products"]
-        for edge in prod["edges"]:
-            ids.append(edge["node"]["id"])
-        if not prod["pageInfo"]["hasNextPage"]:
+        variables = {"cursor": cursor}
+        resp = requests.post(GRAPHQL_URL, json={"query": query, "variables": variables}, headers=headers)
+        data = resp.json()
+        # Verificar errores en la respuesta
+        if "errors" in data:
+            raise Exception(f"Error al consultar productos a eliminar: {data['errors']}")
+        productos = data["data"]["products"]
+        for edge in productos["edges"]:
+            productos_a_eliminar.append(edge["node"]["id"])
+        if productos["pageInfo"]["hasNextPage"]:
+            cursor = productos["pageInfo"]["endCursor"]
+        else:
             break
-        cursor = prod["edges"][-1]["cursor"]
-    return ids
 
+    # Eliminar cada producto obtenido
+    if not productos_a_eliminar:
+        print("No hay productos ImportadoAPI previos para eliminar.")
+    else:
+        for product_id in productos_a_eliminar:
+            mutation = '''
+            mutation($input: ProductDeleteInput!) {
+              productDelete(input: $input) {
+                deletedProductId
+                userErrors { field message }
+              }
+            }
+            '''
+            variables = {"input": {"id": product_id}}
+            resp = requests.post(GRAPHQL_URL, json={"query": mutation, "variables": variables}, headers=headers)
+            result = resp.json()
+            if "errors" in result or result.get("data", {}).get("productDelete", {}).get("userErrors"):
+                # Si ocurre un error al eliminar, mostramos mensaje pero continuamos con los demás
+                mensaje_error = result.get("errors") or result["data"]["productDelete"]["userErrors"]
+                print(f"Error eliminando producto {product_id}: {mensaje_error}")
+        print(f"Eliminados {len(productos_a_eliminar)} productos con etiqueta ImportadoAPI.")
 
-def publish_to_online(ids):
-    mutation = """
-    mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
-      publishablePublish(id: $id, input: $input) {
+# Fase 2: Obtener productos de la API externa y construir archivo JSONL para Bulk API
+def obtener_productos_externos():
+    """
+    Llama a la API externa por subfamilias y recopila todos los productos en una lista.
+    Retorna una lista de productos (dicts) obtenidos de la fuente externa.
+    """
+    productos_fuente = []
+    subfamilias = ["subfamilia1", "subfamilia2", "subfamilia3"]  # Ejemplo de subfamilias a consultar
+    for subfamilia in subfamilias:
+        url = f"https://api.externo.com/productos/{subfamilia}"  # URL de la API externa para la subfamilia
+        resp = requests.get(url)
+        if resp.status_code == 200:
+            data = resp.json()
+            # Suponiendo que la respuesta contiene una lista de productos bajo la clave 'products'
+            productos_fuente.extend(data.get("products", []))
+        else:
+            print(f"Advertencia: Falló la consulta de la subfamilia {subfamilia} (status {resp.status_code})")
+    return productos_fuente
+
+def construir_jsonl_productos(productos):
+    """
+    Construye el contenido JSONL (línea por línea en formato JSON) para la importación Bulk de productos.
+    Retorna el nombre de archivo del JSONL generado.
+    """
+    jsonl_filename = "productos_import.jsonl"
+    with open(jsonl_filename, "w", encoding="utf-8") as jsonl_file:
+        for producto in productos:
+            # Construir la mutación GraphQL para crear/actualizar un producto
+            titulo = producto.get("titulo")  # ajuste según las claves reales del JSON externo
+            descripcion = producto.get("descripcion_html")  # HTML de descripción
+            precio = producto.get("precio")  # precio del producto
+            sku = producto.get("sku")
+            stock = producto.get("stock", 0)
+            imagen_url = producto.get("imagen_url")  # URL de una imagen principal
+            tags = producto.get("tags", [])
+            # Asegurar que la etiqueta ImportadoAPI esté presente
+            if "ImportadoAPI" not in tags:
+                tags.append("ImportadoAPI")
+
+            # Construir el payload JSON para la mutación productCreate (o productUpsert/productUpdate según corresponda)
+            product_input = {
+                "title": titulo,
+                "bodyHtml": descripcion,
+                "status": "ACTIVE",           # Publicar directamente el producto (estado activo)
+                "tags": tags,
+                "variants": [
+                    {
+                        "sku": sku,
+                        "price": str(precio) if precio is not None else "0.0",
+                        "inventoryQuantity": stock
+                    }
+                ]
+            }
+            if imagen_url:
+                # Agregar imagen si existe URL
+                product_input["images"] = [{"src": imagen_url}]
+
+            # Crear la línea JSON (codificar product_input como JSON dentro de la mutación GraphQL)
+            mutation_line = {
+                "id": None,
+                "operation": "mutation productCreate($input: ProductInput!) { productCreate(input: $input) { product { id } userErrors { message } } }",
+                "input": product_input
+            }
+            # Escribir la línea en formato JSONL
+            jsonl_file.write(json.dumps(mutation_line, ensure_ascii=False) + "\n")
+    return jsonl_filename
+
+# Fase 3: Subir el archivo JSONL a Shopify (staged upload) e iniciar la operación Bulk
+def ejecutar_bulk_import(jsonl_filename):
+    # Paso 3.1: Solicitar URLs de subida mediante stagedUploadsCreate
+    mutation = '''
+    mutation {
+      stagedUploadsCreate(input: {
+        resource: BULK_MUTATION_VARIABLES,
+        filename: "%s",
+        mimeType: "text/plain"
+      }) {
+        userErrors { field message }
+        stagedTargets {
+          url
+          resourceUrl
+          parameters { name value }
+        }
+      }
+    }
+    ''' % jsonl_filename
+    headers = {"Content-Type": "application/json", "X-Shopify-Access-Token": ACCESS_TOKEN}
+    resp = requests.post(GRAPHQL_URL, json={"query": mutation}, headers=headers)
+    data = resp.json()
+    if "errors" in data or data.get("data", {}).get("stagedUploadsCreate", {}).get("userErrors"):
+        raise Exception(f"Error al solicitar staged upload: {data}")
+    staged_target = data["data"]["stagedUploadsCreate"]["stagedTargets"][0]
+    upload_url = staged_target["url"]
+    resource_url = staged_target["resourceUrl"]
+    # Parámetros para la subida (campos de formulario)
+    form_params = { param["name"]: param["value"] for param in staged_target["parameters"] }
+
+    # Paso 3.2: Subir el archivo JSONL al URL proporcionado (Amazon S3)
+    with open(jsonl_filename, "rb") as f:
+        files = {'file': (jsonl_filename, f, 'text/plain')}
+        # Realizar POST al upload_url con los form params y el archivo
+        upload_resp = requests.post(upload_url, data=form_params, files=files)
+        if upload_resp.status_code != 204:
+            raise Exception(f"Error subiendo el archivo JSONL a S3: {upload_resp.status_code} - {upload_resp.text}")
+
+    # Paso 3.3: Iniciar la operación Bulk con bulkOperationRunMutation utilizando el resourceUrl del archivo subido
+    bulk_mutation = '''
+    mutation {
+      bulkOperationRunMutation(
+        mutation: "mutation importProducts($input: ProductInput!) { productCreate(input: $input) { product { id } userErrors { message } } }",
+        stagedUploadPath: "%s"
+      ) {
+        bulkOperation {
+          id
+          status
+        }
         userErrors { field message }
       }
-    }"""
-    for pid in ids:
-        variables = {"id": pid, "input": [{"publicationId": PUBLICATION_ID}]}
-        resp = requests.post(GRAPHQL_ENDPOINT, headers=HEADERS,
-                             json={"query": mutation, "variables": variables})
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("errors"):
-            print(f"❌ GraphQL errors en {pid}:", data["errors"])
-            continue
-        errs = data["data"]["publishablePublish"]["userErrors"]
-        if errs:
-            print(f"❌ Errores publicando {pid}:", errs)
-        else:
-            print(f"✅ Publicado en Tienda Online: {pid}")
+    }
+    ''' % resource_url
+    resp = requests.post(GRAPHQL_URL, json={"query": bulk_mutation}, headers=headers)
+    result = resp.json()
+    if "errors" in result or result.get("data", {}).get("bulkOperationRunMutation", {}).get("userErrors"):
+        raise Exception(f"Error al iniciar Bulk Operation: {result}")
 
+    bulk_op = result["data"]["bulkOperationRunMutation"]["bulkOperation"]
+    print(f"Bulk operation iniciada (ID: {bulk_op['id']}, status: {bulk_op['status']}).")
 
-def main(dry_run=False):
-    print("📦  Fetching externos…")
-    externos = fetch_external()
-    print(f"   → {len(externos)} productos descargados")
-    if dry_run:
-        return
+    # (Opcional) Paso 3.4: Consultar el estado hasta que finalice
+    # Aquí podríamos agregar lógica para hacer polling del estado de la operación bulk hasta que sea "COMPLETED"
+    # por simplicidad, asumimos que el proceso se completa externamente (por ejemplo, esperando a que Shopify lo procese).
+    return bulk_op["id"]
 
-    print("🔨  Construyendo JSONL…")
-    lines = build_jsonl_lines(externos)
-
-    print("☁️   Creando staged upload…")
-    upload_url, upload_params, staged_path = staged_upload()
-
-    print("🚀  Subiendo archivo…")
-    upload_file(upload_url, upload_params, lines)
-
-    print("⏳  Ejecutando Bulk…")
-    bulk_id = run_bulk(staged_path)
-
-    print("⏳ Esperando a que termine el Bulk…")
-    wait_for_bulk(bulk_id)
-
-    print("📢 Publicando en Tienda Online…")
-    ids = get_imported_ids()
-    publish_to_online(ids)
-
+# Fase 4: (Opcional) Publicar los nuevos productos en el canal online si no se hizo en la creación
+# Nota: En este caso hemos establecido status = "ACTIVE" en la creación, lo que publica el producto.
+# Si necesitáramos asegurarnos de la publicación en un canal específico, usaríamos publishablePublish con el ID del canal online.
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Solo descarga y cuenta productos")
-    args = parser.parse_args()
-    main(dry_run=args.dry_run)
+    # 1. Eliminar productos antiguos importados
+    eliminar_productos_importados()
+    # 2. Obtener datos de productos desde la API externa
+    productos_nuevos = obtener_productos_externos()
+    # 3. Construir archivo JSONL con las mutaciones de creación de productos
+    jsonl_file = construir_jsonl_productos(productos_nuevos)
+    # 4. Ejecutar la importación masiva (Bulk API) de los nuevos productos
+    try:
+        bulk_id = ejecutar_bulk_import(jsonl_file)
+        print(f"Importación Bulk iniciada. ID de operación: {bulk_id}")
+    except Exception as e:
+        print(f"Error en la importación Bulk: {e}")
