@@ -48,22 +48,23 @@ def fetch_external():
 
 def get_imported_products_map():
     """
-    Obtiene todos los productos ya importados (etiqueta ImportadoAPI) y devuelve
-    un dict mapping handle -> product ID.
+    Obtiene todos los productos ya importados (etiqueta ImportadoAPI)
+    y devuelve un dict mapping handle -> product ID.
     """
     query = '''
     query($cursor: String) {
       products(first: 100, after: $cursor, query: "tag:ImportadoAPI") {
         pageInfo { hasNextPage endCursor }
-        edges { cursor node { id handle } }
+        edges { node { id handle } }
       }
     }'''
     existing = {}
     cursor = None
     while True:
-        variables = {"cursor": cursor}
-        resp = requests.post(GRAPHQL_ENDPOINT, headers=HEADERS,
-                             json={"query": query, "variables": variables})
+        resp = requests.post(
+            GRAPHQL_ENDPOINT, headers=HEADERS,
+            json={"query": query, "variables": {"cursor": cursor}}
+        )
         resp.raise_for_status()
         data = resp.json()["data"]["products"]
         for edge in data["edges"]:
@@ -75,17 +76,32 @@ def get_imported_products_map():
     return existing
 
 
-def build_jsonl_lines(productos):
+def build_jsonl_lines(productos, existing_map):
     """
-    Construye las líneas JSONL para Bulk API y devuelve (líneas, set(handles)).
+    Construye las líneas JSONL para Bulk API, evita duplicados en el feed y
+    usa 'id' en el objeto si ya existe para forzar upsert en lugar de create.
+    Retorna (líneas, set(handles)).
     """
     lines = []
     handles = set()
+    seen = set()
+
     for p in productos:
-        ean    = str(p.get("EAN", ""))
-        sku    = str(p.get("REF", ""))
-        title  = p.get("NAME", "")
-        subfam = p.get("SUBFAMILIA", "")
+        ean    = str(p.get("EAN", "")).strip()
+        handle = f"ean-{ean}"
+        if handle in seen:
+            # evita duplicados en el feed externo
+            continue
+        seen.add(handle)
+        handles.add(handle)
+
+        # Datos básicos
+        sku    = str(p.get("REF", "")).strip()
+        title  = p.get("NAME", "").strip()
+        subfam = p.get("SUBFAMILIA", "").strip()
+        desc   = p.get("DESCRIPTION", "").strip()
+        img    = p.get("URL_IMG")
+        stock  = int(float(p.get("STOCK", "0")))
 
         # Cálculo de precio con IVA y margen
         pvd_raw    = p.get("PVD", "0").replace(".", "").replace(",", ".")
@@ -94,55 +110,48 @@ def build_jsonl_lines(productos):
         base       = float(pvd_raw) + float(canon_raw)
         sin_iva    = base * (1 + margin_pct / 100)
         con_iva    = sin_iva * (1 + IVA / 100)
-        precio     = math.floor(con_iva * 100) / 100.0
+        price      = math.floor(con_iva * 100) / 100.0
 
-        stock  = int(float(p.get("STOCK", "0")))
-        desc   = p.get("DESCRIPTION", "")
-        img    = p.get("URL_IMG")
-        handle = f"ean-{ean}"
-        handles.add(handle)
-
+        # Construcción del objeto de mutación
         node = {
+            # si el handle ya existe, incluimos id para upsert
+            **({"id": existing_map[handle]} if handle in existing_map else {}),
             "handle":          handle,
             "title":           title,
             "descriptionHtml": desc,
             "status":          "ACTIVE",
             "productType":     subfam,
             "tags":            ["ImportadoAPI"],
-            "productOptions": [
-                {"name": "SKU", "values": [{"name": sku}]}
-            ],
-            "variants": [
-                {
-                    "sku":               sku,
-                    "barcode":           ean,
-                    "price":             f"{precio:.2f}",
-                    "inventoryPolicy":   "DENY",
-                    "inventoryItem":     {"tracked": True},
-                    "inventoryQuantities": [
-                        {"locationId": LOCATION_ID, "name": "available", "quantity": stock}
-                    ],
-                    "optionValues": [
-                        {"name": sku, "optionName": "SKU"}
-                    ]
-                }
-            ]
+            "productOptions":  [{"name": "SKU", "values": [{"name": sku}]}],
+            "variants": [{
+                "sku":             sku,
+                "barcode":         ean,
+                "price":           f"{price:.2f}",
+                "inventoryPolicy": "DENY",
+                "inventoryItem":   {"tracked": True},
+                "inventoryQuantities": [
+                    {"locationId": LOCATION_ID, "name": "available", "quantity": stock}
+                ],
+                "optionValues": [{"name": sku, "optionName": "SKU"}]
+            }]
         }
         if img:
             node["files"] = [{"alt": title, "originalSource": img}]
 
+        # Cada línea usa productSet (upsert)
         lines.append({"input": node})
+
     return lines, handles
 
 
 def staged_upload():
-    mutation = '''
+    mutation = """
     mutation($input: [StagedUploadInput!]!) {
       stagedUploadsCreate(input: $input) {
         stagedTargets { url parameters { name value } }
         userErrors { field message }
       }
-    }'''
+    }"""
     variables = {"input": [{
         "resource":   "BULK_MUTATION_VARIABLES",
         "filename":   "productos.jsonl",
@@ -154,10 +163,10 @@ def staged_upload():
     resp.raise_for_status()
     result = resp.json()["data"]["stagedUploadsCreate"]
     if result.get("userErrors"):
-        raise SystemExit("Errores en stagedUploadsCreate: %s" % result["userErrors"])
-    target = result["stagedTargets"][0]
-    params = {p["name"]: p["value"] for p in target["parameters"]}
-    return target["url"], params, params["key"]
+        raise SystemExit(f"Errores stagedUploadsCreate: {result['userErrors']}")
+    tgt = result["stagedTargets"][0]
+    params = {p["name"]: p["value"] for p in tgt["parameters"]}
+    return tgt["url"], params, params["key"]
 
 
 def upload_file(upload_url, upload_params, lines):
@@ -168,7 +177,7 @@ def upload_file(upload_url, upload_params, lines):
 
 
 def run_bulk(staged_path):
-    mutation = '''
+    mutation = """
     mutation($stagedPath: String!, $productMutation: String!) {
       bulkOperationRunMutation(
         mutation: $productMutation,
@@ -177,11 +186,11 @@ def run_bulk(staged_path):
         bulkOperation { id status }
         userErrors { field message }
       }
-    }'''
-    product_mutation = '''
+    }"""
+    product_mutation = """
     mutation productUpsert($input: ProductSetInput!) {
       productSet(input: $input) { product { id } userErrors { field message } }
-    }'''
+    }"""
     resp = requests.post(GRAPHQL_ENDPOINT, headers=HEADERS, json={
         "query":     mutation,
         "variables": {"stagedPath": staged_path, "productMutation": product_mutation}
@@ -189,20 +198,22 @@ def run_bulk(staged_path):
     resp.raise_for_status()
     data = resp.json()["data"]["bulkOperationRunMutation"]
     if data.get("userErrors"):
-        raise SystemExit("Errores en bulkOperationRunMutation: %s" % data["userErrors"])
+        raise SystemExit(f"Errores bulkOperationRunMutation: {data['userErrors']}")
     bulk_id = data["bulkOperation"]["id"]
     print("✅ Bulk iniciado:", bulk_id)
     return bulk_id
 
 
 def wait_for_bulk(bulk_id, interval=5):
-    query = '''
+    query = """
     query($id: ID!) {
       node(id: $id) { ... on BulkOperation { status } }
-    }'''
+    }"""
     while True:
-        resp = requests.post(GRAPHQL_ENDPOINT, headers=HEADERS,
-                             json={"query": query, "variables": {"id": bulk_id}})
+        resp = requests.post(
+            GRAPHQL_ENDPOINT, headers=HEADERS,
+            json={"query": query, "variables": {"id": bulk_id}}
+        )
         resp.raise_for_status()
         status = resp.json()["data"]["node"]["status"]
         print("⏳ BulkOperation status:", status)
@@ -214,12 +225,12 @@ def wait_for_bulk(bulk_id, interval=5):
 
 
 def publish_to_online(ids):
-    mutation = '''
+    mutation = """
     mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
       publishablePublish(id: $id, input: $input) {
         userErrors { field message }
       }
-    }'''
+    }"""
     for pid in ids:
         resp = requests.post(
             GRAPHQL_ENDPOINT,
@@ -236,7 +247,7 @@ def publish_to_online(ids):
 
 def delete_obsolete(existing_map, new_handles):
     """
-    Borra (productDelete) aquellos productos importados previamente cuya handle
+    Borra aquellos productos importados previamente cuya handle
     ya no aparece en new_handles.
     """
     obsolete = [pid for h, pid in existing_map.items() if h not in new_handles]
@@ -245,10 +256,13 @@ def delete_obsolete(existing_map, new_handles):
         return
 
     print(f"🗑️  Eliminando {len(obsolete)} productos obsoletos…")
-    mutation = '''
+    mutation = """
     mutation productDelete($input: ProductDeleteInput!) {
-      productDelete(input: $input) { deletedProductId userErrors { field message } }
-    }'''
+      productDelete(input: $input) {
+        deletedProductId
+        userErrors { field message }
+      }
+    }"""
     for pid in obsolete:
         resp = requests.post(
             GRAPHQL_ENDPOINT,
@@ -270,12 +284,12 @@ def main(dry_run=False):
     if dry_run:
         return
 
-    # 1) Map de productos ya importados
+    # 1) Mapa de productos ya importados antes de la actualización
     existing_map = get_imported_products_map()
 
-    # 2) Construir JSONL y obtener handles nuevos
+    # 2) Construir JSONL y obtener nuevos handles (sin duplicados)
     print("🔨 Construyendo JSONL…")
-    lines, new_handles = build_jsonl_lines(externos)
+    lines, new_handles = build_jsonl_lines(externos, existing_map)
 
     # 3) Subida staged & Bulk import
     print("☁️ Creando staged upload…")
@@ -290,12 +304,12 @@ def main(dry_run=False):
     print("⏳ Esperando a que termine el Bulk…")
     wait_for_bulk(bulk_id)
 
-    # 4) Publicar todos los importados en el canal online
-    ids = list(existing_map.values())  # publishablePublish no requiere acotar solo nuevos
+    # 4) Obtener el mapa actualizado tras el bulk, y publicar todos los productos
+    updated_map = get_imported_products_map()
     print("📢 Publicando en Tienda Online…")
-    publish_to_online(ids)
+    publish_to_online(list(updated_map.values()))
 
-    # 5) Eliminar los obsoletos
+    # 5) Eliminar los productos obsoletos (los que existían antes y ya no están en new_handles)
     delete_obsolete(existing_map, new_handles)
 
 
