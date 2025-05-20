@@ -31,6 +31,7 @@ HEADERS = {
 
 SUBFAMILIAS = [s.strip() for s in RAW_SUBS.split(",") if s.strip()]
 
+
 def fetch_external():
     productos = []
     for sub in SUBFAMILIAS:
@@ -38,6 +39,7 @@ def fetch_external():
         resp = requests.get(url); resp.raise_for_status()
         productos.extend(resp.json())
     return productos
+
 
 def get_imported_products_map():
     """
@@ -80,11 +82,13 @@ def get_imported_products_map():
         cursor = data["pageInfo"]["endCursor"]
     return existing
 
+
 def build_jsonl_lines(productos, existing_map):
     """
     Prepara las líneas JSONL para el Bulk:
      - deduplica en base a SKU
      - si sku en existing_map -> incluye "id" para hacer upsert
+     - define productOptions, optionValues y files
     Retorna (lines, set_of_skus)
     """
     lines = []
@@ -117,12 +121,21 @@ def build_jsonl_lines(productos, existing_map):
         node = {
             # upsert si ya existía este SKU
             **({"id": existing_map[sku]} if sku in existing_map else {}),
+
+            # estos tres bloques son obligatorios para ProductSetInput:
             "handle":          f"ean-{ean}",
             "title":           title,
             "descriptionHtml": desc,
             "status":          "ACTIVE",
             "productType":     subfam,
             "tags":            ["ImportadoAPI"],
+
+            # 1) opciones de producto (necesarias para optionValues)
+            "productOptions": [
+                {"name": "SKU", "values": [{"name": sku}]}
+            ],
+
+            # 2) variante con su opción y stock
             "variants": [{
                 "sku":             sku,
                 "barcode":         ean,
@@ -131,15 +144,22 @@ def build_jsonl_lines(productos, existing_map):
                 "inventoryItem":   {"tracked": True},
                 "inventoryQuantities": [
                     {"locationId": LOCATION_ID, "name": "available", "quantity": stock}
+                ],
+                # asociación variante→opción
+                "optionValues": [
+                    {"name": sku, "optionName": "SKU"}
                 ]
             }]
         }
+
+        # 3) imágenes con el nombre de campo correcto
         if img:
-            node["images"] = [{"src": img, "alt": title}]
+            node["files"] = [{"alt": title, "originalSource": img}]
 
         lines.append({"input": node})
 
     return lines, new_skus
+
 
 def staged_upload():
     mutation = """
@@ -158,18 +178,17 @@ def staged_upload():
     resp = requests.post(GRAPHQL_ENDPOINT, headers=HEADERS,
                          json={"query": mutation, "variables": vars})
     resp.raise_for_status()
-    result = resp.json()["data"]["stagedUploadsCreate"]
-    if result.get("userErrors"):
-        raise SystemExit(f"Errores stagedUploadsCreate: {result['userErrors']}")
-    tgt = result["stagedTargets"][0]
+    tgt = resp.json()["data"]["stagedUploadsCreate"]["stagedTargets"][0]
     params = {p["name"]: p["value"] for p in tgt["parameters"]}
     return tgt["url"], params, params["key"]
+
 
 def upload_file(upload_url, upload_params, lines):
     content = "\n".join(json.dumps(l) for l in lines)
     files   = {"file": ("productos.jsonl", io.BytesIO(content.encode()), "application/json")}
     resp = requests.post(upload_url, data=upload_params, files=files)
     resp.raise_for_status()
+
 
 def run_bulk(staged_path):
     mutation = """
@@ -191,11 +210,13 @@ def run_bulk(staged_path):
         "variables": {"stagedPath": staged_path, "productMutation": product_mutation}
     })
     resp.raise_for_status()
-    data = resp.json()["data"]["bulkOperationRunMutation"]
-    if data.get("userErrors"):
-        raise SystemExit(f"Errores bulkOperationRunMutation: {data['userErrors']}")
-    print("✅ Bulk iniciado:", data["bulkOperation"]["id"])
-    return data["bulkOperation"]["id"]
+    errs = resp.json()["data"]["bulkOperationRunMutation"]["userErrors"]
+    if errs:
+        raise SystemExit(f"Errores bulkOperationRunMutation: {errs}")
+    bulk_id = resp.json()["data"]["bulkOperationRunMutation"]["bulkOperation"]["id"]
+    print("✅ Bulk iniciado:", bulk_id)
+    return bulk_id
+
 
 def wait_for_bulk(bulk_id, interval=5):
     query = """
@@ -203,8 +224,10 @@ def wait_for_bulk(bulk_id, interval=5):
       node(id: $id) { ... on BulkOperation { status } }
     }"""
     while True:
-        resp = requests.post(GRAPHQL_ENDPOINT, headers=HEADERS,
-                             json={"query": query, "variables": {"id": bulk_id}})
+        resp = requests.post(
+            GRAPHQL_ENDPOINT, headers=HEADERS,
+            json={"query": query, "variables": {"id": bulk_id}}
+        )
         resp.raise_for_status()
         status = resp.json()["data"]["node"]["status"]
         print("⏳ BulkOperation status:", status)
@@ -213,6 +236,7 @@ def wait_for_bulk(bulk_id, interval=5):
         time.sleep(interval)
     if status != "COMPLETED":
         raise RuntimeError(f"Bulk ended with status {status}")
+
 
 def publish_to_online(ids):
     mutation = """
@@ -228,11 +252,12 @@ def publish_to_online(ids):
             json={"query": mutation, "variables": {"id": pid, "input": [{"publicationId": PUBLICATION_ID}]}}
         )
         resp.raise_for_status()
-        errs = resp.json().get("data", {}).get("publishablePublish", {}).get("userErrors", [])
+        errs = resp.json()["data"]["publishablePublish"]["userErrors"]
         if errs:
             print(f"❌ Error publicando {pid}:", errs)
         else:
             print(f"✅ Publicado: {pid}")
+
 
 def delete_obsolete(existing_map, new_skus):
     obsolete = [pid for sku, pid in existing_map.items() if sku not in new_skus]
@@ -254,20 +279,25 @@ def delete_obsolete(existing_map, new_skus):
             json={"query": mutation, "variables": {"input": {"id": pid}}}
         )
         resp.raise_for_status()
-        errs = resp.json().get("data", {}).get("productDelete", {}).get("userErrors", [])
+        errs = resp.json()["data"]["productDelete"]["userErrors"]
         if errs:
             print(f"❌ Error borrando {pid}:", errs)
         else:
             print(f"🗑️ Borrado: {pid}")
 
+
 def main(dry_run=False):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true", help="Sólo fetch y conteo")
+    args = parser.parse_args()
+
     print("📦 Fetching externos…")
     externos = fetch_external()
     print(f"   → {len(externos)} productos descargados")
-    if dry_run:
+    if args.dry_run:
         return
 
-    # 1) Mapa actual sku->productId
+    # 1) Mapa sku->productId antes de actualizar
     existing_map = get_imported_products_map()
 
     # 2) Prepara JSONL con upsert por SKU
@@ -284,7 +314,7 @@ def main(dry_run=False):
     print("⏳ Esperando fin…")
     wait_for_bulk(bulk_id)
 
-    # 4) Publicar todos los productos actualizados/creados
+    # 4) Publicar los productos actualizados/creados
     updated_map = get_imported_products_map()
     print("📢 Publicando…")
     publish_to_online(list(updated_map.values()))
@@ -292,8 +322,6 @@ def main(dry_run=False):
     # 5) Borrar sólo los SKUs que ya no están
     delete_obsolete(existing_map, new_skus)
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true", help="Sólo fetch y conteo")
-    args = parser.parse_args()
-    main(dry_run=args.dry_run)
+    main()
