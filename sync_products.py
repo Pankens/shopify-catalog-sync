@@ -29,100 +29,100 @@ HEADERS = {
     "X-Shopify-Access-Token": SHOP_TOKEN
 }
 
-# Lista de subfamilias a consultar
 SUBFAMILIAS = [s.strip() for s in RAW_SUBS.split(",") if s.strip()]
 
-
 def fetch_external():
-    """
-    Llama a la API externa por cada subfamilia y recopila todos los productos.
-    """
     productos = []
     for sub in SUBFAMILIAS:
         url = f"https://fastapi-megasur.onrender.com/catalogo?subfamilia={quote_plus(sub)}"
-        resp = requests.get(url)
-        resp.raise_for_status()
+        resp = requests.get(url); resp.raise_for_status()
         productos.extend(resp.json())
     return productos
 
-
 def get_imported_products_map():
     """
-    Obtiene todos los productos ya importados (etiqueta ImportadoAPI)
-    y devuelve un dict mapping handle -> product ID.
+    Consulta todos los productos con tag ImportadoAPI y
+    construye un dict sku -> productId
     """
-    query = '''
+    query = """
     query($cursor: String) {
       products(first: 100, after: $cursor, query: "tag:ImportadoAPI") {
         pageInfo { hasNextPage endCursor }
-        edges { node { id handle } }
+        edges {
+          node {
+            id
+            variants(first: 1) {
+              edges { node { sku } }
+            }
+          }
+        }
       }
-    }'''
+    }"""
     existing = {}
     cursor = None
     while True:
         resp = requests.post(
-            GRAPHQL_ENDPOINT, headers=HEADERS,
+            GRAPHQL_ENDPOINT,
+            headers=HEADERS,
             json={"query": query, "variables": {"cursor": cursor}}
         )
         resp.raise_for_status()
         data = resp.json()["data"]["products"]
         for edge in data["edges"]:
             node = edge["node"]
-            existing[node["handle"]] = node["id"]
+            var_edges = node["variants"]["edges"]
+            if not var_edges:
+                continue
+            sku = var_edges[0]["node"]["sku"]
+            existing[sku] = node["id"]
         if not data["pageInfo"]["hasNextPage"]:
             break
         cursor = data["pageInfo"]["endCursor"]
     return existing
 
-
 def build_jsonl_lines(productos, existing_map):
     """
-    Construye las líneas JSONL para Bulk API, evita duplicados en el feed y
-    usa 'id' en el objeto si ya existe para forzar upsert en lugar de create.
-    Retorna (líneas, set(handles)).
+    Prepara las líneas JSONL para el Bulk:
+     - deduplica en base a SKU
+     - si sku en existing_map -> incluye "id" para hacer upsert
+    Retorna (lines, set_of_skus)
     """
     lines = []
-    handles = set()
     seen = set()
+    new_skus = set()
 
     for p in productos:
-        ean    = str(p.get("EAN", "")).strip()
-        handle = f"ean-{ean}"
-        if handle in seen:
-            # evita duplicados en el feed externo
+        sku = str(p.get("REF", "")).strip()
+        if not sku or sku in seen:
             continue
-        seen.add(handle)
-        handles.add(handle)
+        seen.add(sku)
+        new_skus.add(sku)
 
-        # Datos básicos
-        sku    = str(p.get("REF", "")).strip()
+        ean    = str(p.get("EAN", "")).strip()
         title  = p.get("NAME", "").strip()
         subfam = p.get("SUBFAMILIA", "").strip()
         desc   = p.get("DESCRIPTION", "").strip()
         img    = p.get("URL_IMG")
         stock  = int(float(p.get("STOCK", "0")))
 
-        # Cálculo de precio con IVA y margen
+        # cálculo de precio
         pvd_raw    = p.get("PVD", "0").replace(".", "").replace(",", ".")
         canon_raw  = p.get("CANON", "0").replace(".", "").replace(",", ".")
         margin_pct = float(p.get("MARGIN", "0").replace(".", "").replace(",", "."))
         base       = float(pvd_raw) + float(canon_raw)
-        sin_iva    = base * (1 + margin_pct / 100)
-        con_iva    = sin_iva * (1 + IVA / 100)
+        sin_iva    = base * (1 + margin_pct/100)
+        con_iva    = sin_iva * (1 + IVA/100)
         price      = math.floor(con_iva * 100) / 100.0
 
-        # Construcción del objeto de mutación
         node = {
-            # si el handle ya existe, incluimos id para upsert
-            **({"id": existing_map[handle]} if handle in existing_map else {}),
-            "handle":          handle,
+            # upsert si ya existía este SKU
+            **({"id": existing_map[sku]} if sku in existing_map else {}),
+            "handle":          f"ean-{ean}",
             "title":           title,
             "descriptionHtml": desc,
             "status":          "ACTIVE",
             "productType":     subfam,
             "tags":            ["ImportadoAPI"],
-            "productOptions":  [{"name": "SKU", "values": [{"name": sku}]}],
             "variants": [{
                 "sku":             sku,
                 "barcode":         ean,
@@ -131,18 +131,15 @@ def build_jsonl_lines(productos, existing_map):
                 "inventoryItem":   {"tracked": True},
                 "inventoryQuantities": [
                     {"locationId": LOCATION_ID, "name": "available", "quantity": stock}
-                ],
-                "optionValues": [{"name": sku, "optionName": "SKU"}]
+                ]
             }]
         }
         if img:
-            node["files"] = [{"alt": title, "originalSource": img}]
+            node["images"] = [{"src": img, "alt": title}]
 
-        # Cada línea usa productSet (upsert)
         lines.append({"input": node})
 
-    return lines, handles
-
+    return lines, new_skus
 
 def staged_upload():
     mutation = """
@@ -152,14 +149,14 @@ def staged_upload():
         userErrors { field message }
       }
     }"""
-    variables = {"input": [{
+    vars = {"input": [{
         "resource":   "BULK_MUTATION_VARIABLES",
         "filename":   "productos.jsonl",
         "mimeType":   "text/jsonl",
         "httpMethod": "POST"
     }]}
     resp = requests.post(GRAPHQL_ENDPOINT, headers=HEADERS,
-                         json={"query": mutation, "variables": variables})
+                         json={"query": mutation, "variables": vars})
     resp.raise_for_status()
     result = resp.json()["data"]["stagedUploadsCreate"]
     if result.get("userErrors"):
@@ -168,13 +165,11 @@ def staged_upload():
     params = {p["name"]: p["value"] for p in tgt["parameters"]}
     return tgt["url"], params, params["key"]
 
-
 def upload_file(upload_url, upload_params, lines):
     content = "\n".join(json.dumps(l) for l in lines)
     files   = {"file": ("productos.jsonl", io.BytesIO(content.encode()), "application/json")}
     resp = requests.post(upload_url, data=upload_params, files=files)
     resp.raise_for_status()
-
 
 def run_bulk(staged_path):
     mutation = """
@@ -199,10 +194,8 @@ def run_bulk(staged_path):
     data = resp.json()["data"]["bulkOperationRunMutation"]
     if data.get("userErrors"):
         raise SystemExit(f"Errores bulkOperationRunMutation: {data['userErrors']}")
-    bulk_id = data["bulkOperation"]["id"]
-    print("✅ Bulk iniciado:", bulk_id)
-    return bulk_id
-
+    print("✅ Bulk iniciado:", data["bulkOperation"]["id"])
+    return data["bulkOperation"]["id"]
 
 def wait_for_bulk(bulk_id, interval=5):
     query = """
@@ -210,10 +203,8 @@ def wait_for_bulk(bulk_id, interval=5):
       node(id: $id) { ... on BulkOperation { status } }
     }"""
     while True:
-        resp = requests.post(
-            GRAPHQL_ENDPOINT, headers=HEADERS,
-            json={"query": query, "variables": {"id": bulk_id}}
-        )
+        resp = requests.post(GRAPHQL_ENDPOINT, headers=HEADERS,
+                             json={"query": query, "variables": {"id": bulk_id}})
         resp.raise_for_status()
         status = resp.json()["data"]["node"]["status"]
         print("⏳ BulkOperation status:", status)
@@ -222,7 +213,6 @@ def wait_for_bulk(bulk_id, interval=5):
         time.sleep(interval)
     if status != "COMPLETED":
         raise RuntimeError(f"Bulk ended with status {status}")
-
 
 def publish_to_online(ids):
     mutation = """
@@ -242,20 +232,14 @@ def publish_to_online(ids):
         if errs:
             print(f"❌ Error publicando {pid}:", errs)
         else:
-            print(f"✅ Publicado en Tienda Online: {pid}")
+            print(f"✅ Publicado: {pid}")
 
-
-def delete_obsolete(existing_map, new_handles):
-    """
-    Borra aquellos productos importados previamente cuya handle
-    ya no aparece en new_handles.
-    """
-    obsolete = [pid for h, pid in existing_map.items() if h not in new_handles]
+def delete_obsolete(existing_map, new_skus):
+    obsolete = [pid for sku, pid in existing_map.items() if sku not in new_skus]
     if not obsolete:
-        print("🗑️  No hay productos obsoletos para eliminar.")
+        print("🗑️ No hay obsoletos que borrar.")
         return
-
-    print(f"🗑️  Eliminando {len(obsolete)} productos obsoletos…")
+    print(f"🗑️ Eliminando {len(obsolete)} obsoletos…")
     mutation = """
     mutation productDelete($input: ProductDeleteInput!) {
       productDelete(input: $input) {
@@ -274,8 +258,7 @@ def delete_obsolete(existing_map, new_handles):
         if errs:
             print(f"❌ Error borrando {pid}:", errs)
         else:
-            print(f"🗑️  Borrado producto: {pid}")
-
+            print(f"🗑️ Borrado: {pid}")
 
 def main(dry_run=False):
     print("📦 Fetching externos…")
@@ -284,38 +267,33 @@ def main(dry_run=False):
     if dry_run:
         return
 
-    # 1) Mapa de productos ya importados antes de la actualización
+    # 1) Mapa actual sku->productId
     existing_map = get_imported_products_map()
 
-    # 2) Construir JSONL y obtener nuevos handles (sin duplicados)
+    # 2) Prepara JSONL con upsert por SKU
     print("🔨 Construyendo JSONL…")
-    lines, new_handles = build_jsonl_lines(externos, existing_map)
+    lines, new_skus = build_jsonl_lines(externos, existing_map)
 
-    # 3) Subida staged & Bulk import
+    # 3) Staged upload y Bulk
     print("☁️ Creando staged upload…")
     upload_url, upload_params, staged_path = staged_upload()
-
     print("🚀 Subiendo archivo…")
     upload_file(upload_url, upload_params, lines)
-
     print("⏳ Ejecutando Bulk…")
     bulk_id = run_bulk(staged_path)
-
-    print("⏳ Esperando a que termine el Bulk…")
+    print("⏳ Esperando fin…")
     wait_for_bulk(bulk_id)
 
-    # 4) Obtener el mapa actualizado tras el bulk, y publicar todos los productos
+    # 4) Publicar todos los productos actualizados/creados
     updated_map = get_imported_products_map()
-    print("📢 Publicando en Tienda Online…")
+    print("📢 Publicando…")
     publish_to_online(list(updated_map.values()))
 
-    # 5) Eliminar los productos obsoletos (los que existían antes y ya no están en new_handles)
-    delete_obsolete(existing_map, new_handles)
-
+    # 5) Borrar sólo los SKUs que ya no están
+    delete_obsolete(existing_map, new_skus)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Solo descarga y cuenta productos")
+    parser.add_argument("--dry-run", action="store_true", help="Sólo fetch y conteo")
     args = parser.parse_args()
     main(dry_run=args.dry_run)
