@@ -128,7 +128,7 @@ def build_jsonl_lines(productos, existing_map):
             "descriptionHtml": desc,
             "status":          "ACTIVE",
             "productType":     subfam,
-            "tags":            ["ImportadoAPI"],
+            "tags":            ["ImportadoAPI", subfam],
 
             # 1) opciones de producto (necesarias para optionValues)
             "productOptions": [
